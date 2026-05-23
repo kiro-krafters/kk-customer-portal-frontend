@@ -1,0 +1,89 @@
+name: Deploy Customer Portal Frontend
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  prepare-and-validate:
+    name: Prepare and Validate
+    runs-on: ubuntu-22.04
+    outputs:
+      env: ${{ steps.validate.outputs.env }}
+      distribution-id: ${{ steps.mapping.outputs.distribution_id }}
+
+    steps:
+      - name: Validate Branch and Environment
+        id: validate
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          ENVIRONMENT="${{ github.event.inputs.environment }}"
+
+          echo "Branch: $BRANCH"
+          echo "Environment: $ENVIRONMENT"
+
+          case "$ENVIRONMENT" in
+            "dev")
+              echo "Any branch can deploy to dev"
+              ;;
+            "prod")
+              if [[ "$BRANCH" != "main" ]]; then
+                echo "Error: Only 'main' branch can deploy to production. Current: '$BRANCH'"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Error: Unknown environment '$ENVIRONMENT'"
+              exit 1
+              ;;
+          esac
+
+          echo "env=$ENVIRONMENT" >> $GITHUB_OUTPUT
+
+      - name: Map environment to AWS resources
+        id: mapping
+        run: |
+          case "${{ steps.validate.outputs.env }}" in
+            dev)
+              echo "distribution_id=E1WFKC90BIH3K" >> $GITHUB_OUTPUT
+              ;;
+            prod)
+              echo "distribution_id=ETK7EO1VMR1AU" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "ERROR: Unknown environment: ${{ steps.validate.outputs.env }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+  deploy-frontend:
+    name: Deploy Frontend - us-east-1 (${{ needs.prepare-and-validate.outputs.env }})
+    needs: prepare-and-validate
+    uses: kiro-krafters/shared-pipelines/.github/workflows/aws_frontend_deploy.yml@main
+    with:
+      CI_ENVIRONMENT_NAME: ${{ needs.prepare-and-validate.outputs.env }}
+      AWS_REGION: us-east-1
+      REGION_PREFIX: use1
+      S3_BUCKET_NAME: kk-s3-customer-portal-use1-${{ needs.prepare-and-validate.outputs.env }}
+      NODE_VERSION: "24"
+      DISTRIBUTION_ID: ${{ needs.prepare-and-validate.outputs.distribution-id }}
+    secrets:
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
