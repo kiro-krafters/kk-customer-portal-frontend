@@ -17,6 +17,7 @@ interface UIMessage {
   role: 'user' | 'bot' | 'agent' | 'system';
   text: string;
   time: string;
+  agentName?: string; // Add agent name field
 }
 
 const ChatWidget = (_props: ChatWidgetProps) => {
@@ -83,8 +84,10 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [conversationHistory, setConversationHistory] = useState<Array<{role: string; content: string}>>([]);
   
   const chatSession = useRef<any>(null);
+  const sessionIdRef = useRef<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -109,6 +112,10 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
   const handleFormSubmit = async (data: PreChatFormData) => {
     setFormData(data);
     setPhase('bot');
+
+    // Generate a session ID for bot conversation
+    const botSessionId = `bot-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    sessionIdRef.current = botSessionId;
 
     // Show local greeting
     appendMessage({
@@ -138,20 +145,22 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
 
     try {
       if (phase === 'bot') {
-        // Use AI bot API (no session yet)
-        const tempSessionId = `temp-${Date.now()}`;
-        const response = await portalApi.sendBotMessage({
-          sessionId: tempSessionId,
-          text: txt,
-          locale: formData?.language === 'es' ? 'es_US' : 'en_US',
+        // Use Bedrock AI API
+        const response = await portalApi.sendBedrockMessage({
+          sessionId: sessionIdRef.current || `bot-${Date.now()}`,
+          message: txt,
+          conversationHistory: conversationHistory,
         });
 
+        // Update conversation history
+        setConversationHistory(response.conversationHistory || []);
+
         // Show bot response
-        if (response.botResponse) {
+        if (response.response) {
           appendMessage({
             id: `bot-${Date.now()}`,
             role: 'bot',
-            text: response.botResponse,
+            text: response.response,
             time: new Date().toISOString(),
           });
         }
@@ -218,21 +227,123 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
 
       // Listen for incoming messages
       session.onMessage((event: any) => {
-        const data = event.data;
-        if (data.ParticipantRole === 'AGENT' || data.ParticipantRole === 'BOT' || data.ParticipantRole === 'SYSTEM') {
+        console.log('📨 Full ChatJS Event:', JSON.stringify(event, null, 2));
+        
+        // ChatJS can structure events differently, try multiple paths
+        const data = event.data || event;
+        const contentType = data.ContentType || data.contentType || event.contentType;
+        const participantRole = data.ParticipantRole || data.participantRole || event.participantRole;
+        const displayName = data.DisplayName || data.displayName || event.displayName;
+        const content = data.Content || data.content || event.content;
+        const messageId = data.Id || data.id || event.id || `msg-${Date.now()}`;
+        const timestamp = data.AbsoluteTime || data.absoluteTime || event.absoluteTime || new Date().toISOString();
+        
+        console.log('📋 Parsed message:', {
+          participantRole,
+          displayName,
+          contentType,
+          content,
+          messageId,
+        });
+        
+        // Skip participant events
+        if (contentType && (
+          contentType.includes('participant.joined') ||
+          contentType.includes('participant.left')
+        )) {
+          console.log('⏭️ Skipping participant event');
+          return;
+        }
+        
+        // Skip if no content
+        if (!content) {
+          console.log('⏭️ Skipping - no content');
+          return;
+        }
+        
+        // Determine role - be case-insensitive
+        const role = participantRole?.toUpperCase();
+        
+        // Skip customer messages (our own messages)
+        if (role === 'CUSTOMER') {
+          console.log('⏭️ Skipping CUSTOMER message (our own)');
+          return;
+        }
+        
+        // During agent phase, treat all messages as agent messages unless explicitly BOT or SYSTEM event
+        if (role === 'AGENT' || !role || role === 'SYSTEM') {
+          // If it's a system event (not a message), show as system
+          if (contentType && contentType.includes('event')) {
+            console.log('ℹ️ System event');
+            return; // Skip system events
+          }
+          
+          // Otherwise, treat as agent message
+          console.log('✅ Adding AGENT message with name:', displayName);
           appendMessage({
-            id: data.Id,
-            role: data.ParticipantRole === 'AGENT' ? 'agent' : data.ParticipantRole === 'BOT' ? 'bot' : 'system',
-            text: data.Content,
-            time: data.AbsoluteTime,
+            id: messageId,
+            role: 'agent',
+            text: content,
+            time: timestamp,
+            agentName: displayName || 'Agent',
+          });
+        } else if (role === 'BOT') {
+          console.log('✅ Adding BOT message');
+          appendMessage({
+            id: messageId,
+            role: 'bot',
+            text: content,
+            time: timestamp,
+          });
+        } else {
+          console.log('⚠️ Unknown role, treating as agent:', role);
+          // Default to agent message during agent phase
+          appendMessage({
+            id: messageId,
+            role: 'agent',
+            text: content,
+            time: timestamp,
+            agentName: displayName || 'Agent',
           });
         }
       });
 
       // Listen for connection established
       session.onConnectionEstablished(() => {
-        console.log('Chat session connected');
+        console.log('✅ Chat session connected');
         setPhase('agent');
+        
+        // Fetch transcript to get any messages we might have missed
+        session.getTranscript({
+          maxResults: 50,
+          sortOrder: 'ASCENDING',
+        }).then((response: any) => {
+          console.log('📜 Transcript:', response);
+          
+          const transcript = response.data?.Transcript || [];
+          transcript.forEach((item: any) => {
+            const role = item.ParticipantRole?.toUpperCase();
+            const content = item.Content;
+            const contentType = item.ContentType;
+            
+            // Skip events and customer messages
+            if (contentType?.includes('participant.') || role === 'CUSTOMER') {
+              return;
+            }
+            
+            if (content && (role === 'AGENT' || role === 'BOT')) {
+              appendMessage({
+                id: item.Id || `transcript-${Date.now()}`,
+                role: role === 'AGENT' ? 'agent' : 'bot',
+                text: content,
+                time: item.AbsoluteTime || new Date().toISOString(),
+                agentName: role === 'AGENT' ? (item.DisplayName || 'Agent') : undefined,
+              });
+            }
+          });
+        }).catch((err: any) => {
+          console.error('Failed to fetch transcript:', err);
+        });
       });
 
       // Listen for connection broken
@@ -377,6 +488,8 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
               setPhase('form'); 
               setMessages([]); 
               setFormData(null);
+              setConversationHistory([]);
+              sessionIdRef.current = null;
               if (chatSession.current) {
                 chatSession.current.disconnectParticipant();
                 chatSession.current = null;
@@ -456,7 +569,11 @@ const MessageBubble = ({ message }: { message: UIMessage }) => {
             : 'bg-white text-gray-700 border border-border rounded-bl-sm shadow-card'
         }`}
       >
-        {isAgent && <span className="text-[10px] font-bold text-green-600 block mb-0.5">Live Agent</span>}
+        {isAgent && message.agentName && (
+          <span className="text-[10px] font-bold text-green-600 block mb-0.5">
+            {message.agentName}
+          </span>
+        )}
         {renderText(message.text)}
       </div>
     </div>

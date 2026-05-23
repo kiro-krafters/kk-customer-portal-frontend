@@ -89,6 +89,19 @@ export interface ContactResponse {
   status: string;
 }
 
+export interface BedrockMessageRequest {
+  sessionId: string;
+  message: string;
+  conversationHistory: Array<{role: string; content: string}>;
+}
+
+export interface BedrockMessageResponse {
+  response: string;
+  transferRequired: boolean;
+  sessionId: string;
+  conversationHistory: Array<{role: string; content: string}>;
+}
+
 // ── API Functions ──────────────────────────────────────────────────────────
 
 export const portalApi = {
@@ -117,6 +130,13 @@ export const portalApi = {
   /** API #5 — Send message to the AI bot and get bot response */
   sendBotMessage: (body: BotMessageRequest) =>
     request<BotMessageResponse>('/ai/message', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** API #5b — Send message to Bedrock AI bot (Claude 3 Haiku) */
+  sendBedrockMessage: (body: BedrockMessageRequest) =>
+    request<BedrockMessageResponse>('/ai/bedrock/message', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
