@@ -4,7 +4,7 @@ import PreChatForm from './PreChatForm';
 import { portalApi } from '../services/portalApi';
 import type { ChatMessage } from '../services/portalApi';
 
-type ChatPhase = 'form' | 'connecting' | 'chat' | 'ended' | 'error';
+type ChatPhase = 'form' | 'bot' | 'connecting' | 'agent' | 'ended' | 'error';
 
 interface UIMessage {
   id: string;
@@ -76,6 +76,7 @@ const WidgetHeader = ({ onClose }: { onClose: () => void }) => (
 const ChatFlow = ({ onClose }: { onClose: () => void }) => {
   const [phase, setPhase] = useState<ChatPhase>('form');
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [formData, setFormData] = useState<PreChatFormData | null>(null);
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -117,6 +118,11 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
           if (!seenIdsRef.current.has(m.Id) && m.Type === 'MESSAGE') {
             seenIdsRef.current.add(m.Id);
             newMessages.push(convertMessage(m));
+            
+            // Detect agent joining
+            if (m.ParticipantRole === 'AGENT') {
+              setPhase('agent');
+            }
           }
         }
         
@@ -130,38 +136,28 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
   };
 
   const handleFormSubmit = async (data: PreChatFormData) => {
-    setPhase('connecting');
+    setFormData(data);
+    setPhase('bot');
 
-    try {
-      // Start Connect chat session
-      const result = await portalApi.startChat({
-        customerName: data.customerName,
-        policyNumber: data.policyNumber,
-        topic: topicLabel(data.issueType),
-        language: data.language,
-      });
-      
-      setSessionId(result.sessionId);
-      
-      // Start polling for messages (including bot greeting)
-      startPolling(result.sessionId);
-      
-      setPhase('chat');
-      setTimeout(() => inputRef.current?.focus(), 100);
-    } catch (err) {
-      console.error('Failed to start session:', err);
-      setPhase('error');
-    }
+    // Show local greeting
+    appendMessage({
+      id: `bot-greet`,
+      role: 'bot',
+      text: `Hi **${data.customerName}**! I'm Kira, your AI assistant. How can I help you with your **${topicLabel(data.issueType)}** today?`,
+      time: new Date().toISOString(),
+    });
+
+    setTimeout(() => inputRef.current?.focus(), 100);
   };
 
   const sendMessage = async (text?: string) => {
     const txt = (text ?? input).trim();
-    if (!txt || sending || !sessionId) return;
+    if (!txt || sending) return;
 
     setInput('');
     setSending(true);
 
-    // Optimistically add user message to UI
+    // Add user message to UI
     appendMessage({
       id: `user-${Date.now()}`,
       role: 'user',
@@ -170,8 +166,33 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
     });
 
     try {
-      // Send message to Connect - the flow handles everything
-      await portalApi.sendMessage(sessionId, txt);
+      if (phase === 'bot') {
+        // Use AI bot API (no session yet)
+        const tempSessionId = `temp-${Date.now()}`;
+        const response = await portalApi.sendBotMessage({
+          sessionId: tempSessionId,
+          text: txt,
+          locale: formData?.language === 'es' ? 'es_US' : 'en_US',
+        });
+
+        // Show bot response
+        if (response.botResponse) {
+          appendMessage({
+            id: `bot-${Date.now()}`,
+            role: 'bot',
+            text: response.botResponse,
+            time: new Date().toISOString(),
+          });
+        }
+
+        // Check if transfer is required
+        if (response.transferRequired) {
+          await initiateAgentTransfer();
+        }
+      } else if ((phase === 'agent' || phase === 'connecting') && sessionId) {
+        // Send via Connect API
+        await portalApi.sendMessage(sessionId, txt);
+      }
     } catch (err) {
       console.error('Failed to send message:', err);
       appendMessage({
@@ -184,6 +205,49 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
       setSending(false);
       setTimeout(() => inputRef.current?.focus(), 50);
     }
+  };
+
+  const initiateAgentTransfer = async () => {
+    if (!formData) return;
+
+    try {
+      appendMessage({
+        id: `sys-transfer`,
+        role: 'system',
+        text: 'Connecting you to a live agent...',
+        time: new Date().toISOString(),
+      });
+
+      // Start Connect chat session
+      const result = await portalApi.startChat({
+        customerName: formData.customerName,
+        policyNumber: formData.policyNumber,
+        topic: topicLabel(formData.issueType),
+        language: formData.language,
+      });
+
+      setSessionId(result.sessionId);
+      setPhase('connecting');
+
+      // Start polling for messages
+      startPolling(result.sessionId);
+
+      // Send the "I want to talk to an agent" message to Connect
+      await portalApi.sendMessage(result.sessionId, 'I want to talk to an agent');
+    } catch (err) {
+      console.error('Transfer failed:', err);
+      appendMessage({
+        id: `err-transfer`,
+        role: 'system',
+        text: 'Transfer failed. Please try again.',
+        time: new Date().toISOString(),
+      });
+      setPhase('bot');
+    }
+  };
+
+  const requestAgentTransfer = () => {
+    initiateAgentTransfer();
   };
 
   const endChat = async () => {
@@ -208,24 +272,12 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
     return <PreChatForm onSubmit={handleFormSubmit} />;
   }
 
-  if (phase === 'connecting') {
-    return (
-      <div className="flex-1 flex items-center justify-center flex-col gap-3 bg-gray-50 p-8 text-center">
-        <div className="w-12 h-12 rounded-2xl bg-brand-gradient flex items-center justify-center text-white text-xl shadow-btn animate-pulse">
-          K
-        </div>
-        <p className="text-[14px] font-semibold text-gray-700">Starting your session…</p>
-        <p className="text-[12px] text-gray-400">Connecting you to Kira AI</p>
-      </div>
-    );
-  }
-
   if (phase === 'error') {
     return (
       <div className="flex-1 flex items-center justify-center flex-col gap-4 bg-gray-50 p-8 text-center">
         <div className="text-3xl">⚠️</div>
         <p className="text-[14px] font-semibold text-gray-700">Connection Failed</p>
-        <p className="text-[13px] text-gray-500">Unable to connect to agent. Please try again.</p>
+        <p className="text-[13px] text-gray-500">Unable to connect. Please try again.</p>
         <button
           onClick={() => setPhase('bot')}
           className="bg-brand text-white text-[13px] font-semibold px-5 py-2.5 rounded-xl border-none transition hover:bg-brand-dark"
@@ -236,7 +288,7 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
     );
   }
 
-  const quickReplies = phase === 'chat'
+  const quickReplies = phase === 'bot'
     ? ['Claim Status', 'Policy Details', 'Billing', 'Talk to Agent']
     : [];
 
@@ -250,7 +302,7 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
         {phase === 'connecting' && (
           <div className="flex items-center gap-2 text-[12px] text-gray-400 px-1">
             <span className="w-1.5 h-1.5 rounded-full bg-brand animate-pulse" />
-            Connecting to a live agent…
+            Waiting for agent...
           </div>
         )}
         {sending && <TypingIndicator />}
@@ -311,7 +363,7 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
               setMessages([]); 
               setFormData(null);
               setSessionId(null);
-              seenMessageIds.current.clear();
+              seenIdsRef.current.clear();
               stopPolling();
             }}
             className="flex-1 bg-brand text-white text-[13px] font-semibold py-2.5 rounded-xl border-none transition hover:bg-brand-dark"
@@ -331,6 +383,21 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+function convertMessage(m: ChatMessage): UIMessage {
+  const roleMap: Record<string, UIMessage['role']> = {
+    CUSTOMER: 'user',
+    BOT: 'bot',
+    AGENT: 'agent',
+    SYSTEM: 'system',
+  };
+  return {
+    id: m.Id,
+    role: roleMap[m.ParticipantRole] ?? 'system',
+    text: m.Content,
+    time: m.AbsoluteTime,
+  };
+}
 
 function topicLabel(issueType: string): string {
   const map: Record<string, string> = {
