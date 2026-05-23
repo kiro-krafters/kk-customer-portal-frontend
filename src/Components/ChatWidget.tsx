@@ -2,7 +2,13 @@ import { useState, useEffect, useRef } from 'react';
 import type { ChatWidgetProps, PreChatFormData } from '../types/chat';
 import PreChatForm from './PreChatForm';
 import { portalApi } from '../services/portalApi';
-import type { ChatMessage } from '../services/portalApi';
+import 'amazon-connect-chatjs';
+
+declare global {
+  interface Window {
+    connect: any;
+  }
+}
 
 type ChatPhase = 'form' | 'bot' | 'connecting' | 'agent' | 'ended' | 'error';
 
@@ -12,8 +18,6 @@ interface UIMessage {
   text: string;
   time: string;
 }
-
-const POLL_INTERVAL_MS = 2000;
 
 const ChatWidget = (_props: ChatWidgetProps) => {
   const [open, setOpen] = useState(false);
@@ -75,26 +79,17 @@ const WidgetHeader = ({ onClose }: { onClose: () => void }) => (
 
 const ChatFlow = ({ onClose }: { onClose: () => void }) => {
   const [phase, setPhase] = useState<ChatPhase>('form');
-  const [sessionId, setSessionId] = useState<string | null>(null);
   const [formData, setFormData] = useState<PreChatFormData | null>(null);
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   
-  const seenIdsRef = useRef<Set<string>>(new Set());
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const chatSession = useRef<any>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const appendMessage = (msg: UIMessage) => {
     setMessages((prev) => [...prev, msg]);
-  };
-
-  const stopPolling = () => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
   };
 
   // Auto-scroll on new messages
@@ -104,36 +99,12 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
 
   // Cleanup on unmount
   useEffect(() => {
-    return () => stopPolling();
-  }, []);
-
-  const startPolling = (sid: string) => {
-    stopPolling();
-    pollRef.current = setInterval(async () => {
-      try {
-        const data = await portalApi.getMessages(sid);
-        const newMessages: UIMessage[] = [];
-        
-        for (const m of data.messages) {
-          if (!seenIdsRef.current.has(m.Id) && m.Type === 'MESSAGE') {
-            seenIdsRef.current.add(m.Id);
-            newMessages.push(convertMessage(m));
-            
-            // Detect agent joining
-            if (m.ParticipantRole === 'AGENT') {
-              setPhase('agent');
-            }
-          }
-        }
-        
-        if (newMessages.length > 0) {
-          setMessages((prev) => [...prev, ...newMessages]);
-        }
-      } catch (err) {
-        console.error('Polling error:', err);
+    return () => {
+      if (chatSession.current) {
+        chatSession.current.disconnectParticipant();
       }
-    }, POLL_INTERVAL_MS);
-  };
+    };
+  }, []);
 
   const handleFormSubmit = async (data: PreChatFormData) => {
     setFormData(data);
@@ -189,9 +160,12 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
         if (response.transferRequired) {
           await initiateAgentTransfer();
         }
-      } else if ((phase === 'agent' || phase === 'connecting') && sessionId) {
-        // Send via Connect API
-        await portalApi.sendMessage(sessionId, txt);
+      } else if ((phase === 'agent' || phase === 'connecting') && chatSession.current) {
+        // Send via Connect ChatJS
+        chatSession.current.sendMessage({
+          contentType: 'text/plain',
+          message: txt,
+        });
       }
     } catch (err) {
       console.error('Failed to send message:', err);
@@ -211,6 +185,7 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
     if (!formData) return;
 
     try {
+      setPhase('connecting');
       appendMessage({
         id: `sys-transfer`,
         role: 'system',
@@ -226,14 +201,54 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
         language: formData.language,
       });
 
-      setSessionId(result.sessionId);
-      setPhase('connecting');
+      // Initialize Connect ChatJS
+      const session = window.connect.ChatSession.create({
+        chatDetails: {
+          contactId: result.contactId,
+          participantId: result.sessionId,
+          participantToken: result.participantToken,
+        },
+        type: 'CUSTOMER',
+        options: {
+          region: 'us-east-1',
+        },
+      });
 
-      // Start polling for messages
-      startPolling(result.sessionId);
+      chatSession.current = session;
 
-      // Send the "I want to talk to an agent" message to Connect
-      await portalApi.sendMessage(result.sessionId, 'I want to talk to an agent');
+      // Listen for incoming messages
+      session.onMessage((event: any) => {
+        const data = event.data;
+        if (data.ParticipantRole === 'AGENT' || data.ParticipantRole === 'BOT' || data.ParticipantRole === 'SYSTEM') {
+          appendMessage({
+            id: data.Id,
+            role: data.ParticipantRole === 'AGENT' ? 'agent' : data.ParticipantRole === 'BOT' ? 'bot' : 'system',
+            text: data.Content,
+            time: data.AbsoluteTime,
+          });
+        }
+      });
+
+      // Listen for connection established
+      session.onConnectionEstablished(() => {
+        console.log('Chat session connected');
+        setPhase('agent');
+      });
+
+      // Listen for connection broken
+      session.onConnectionBroken(() => {
+        console.log('Chat session disconnected');
+        appendMessage({
+          id: `sys-disconnect`,
+          role: 'system',
+          text: 'Connection lost. Please try again.',
+          time: new Date().toISOString(),
+        });
+      });
+
+      // Connect the session
+      await session.connect();
+      
     } catch (err) {
       console.error('Transfer failed:', err);
       appendMessage({
@@ -251,12 +266,12 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
   };
 
   const endChat = async () => {
-    stopPolling();
-    if (sessionId) {
+    if (chatSession.current) {
       try {
-        await portalApi.endChat(sessionId);
+        chatSession.current.disconnectParticipant();
+        chatSession.current = null;
       } catch (err) {
-        console.error('Failed to end chat:', err);
+        console.error('Failed to disconnect:', err);
       }
     }
     appendMessage({
@@ -362,9 +377,10 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
               setPhase('form'); 
               setMessages([]); 
               setFormData(null);
-              setSessionId(null);
-              seenIdsRef.current.clear();
-              stopPolling();
+              if (chatSession.current) {
+                chatSession.current.disconnectParticipant();
+                chatSession.current = null;
+              }
             }}
             className="flex-1 bg-brand text-white text-[13px] font-semibold py-2.5 rounded-xl border-none transition hover:bg-brand-dark"
           >
@@ -383,21 +399,6 @@ const ChatFlow = ({ onClose }: { onClose: () => void }) => {
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-
-function convertMessage(m: ChatMessage): UIMessage {
-  const roleMap: Record<string, UIMessage['role']> = {
-    CUSTOMER: 'user',
-    BOT: 'bot',
-    AGENT: 'agent',
-    SYSTEM: 'system',
-  };
-  return {
-    id: m.Id,
-    role: roleMap[m.ParticipantRole] ?? 'system',
-    text: m.Content,
-    time: m.AbsoluteTime,
-  };
-}
 
 function topicLabel(issueType: string): string {
   const map: Record<string, string> = {
